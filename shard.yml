@@ -1,0 +1,19 @@
+name: nested_scheduler_io_uring_context
+version: 0.1.0
+
+authors:
+  - Linus Sellberg <sellberg@gmail.com>
+
+crystal: 1.1.1
+
+license: MIT
+
+dependencies:
+  ior:
+    github: yxhuvud/ior
+    branch: master
+    version: ~> 0.7.2
+  nested_scheduler:
+    github: yxhuvud/nested_scheduler
+    branch: main
+    version: ~> 0.4.0
