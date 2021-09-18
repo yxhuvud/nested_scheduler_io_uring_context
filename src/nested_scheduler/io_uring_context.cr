@@ -21,7 +21,7 @@ module NestedScheduler
       get_sqe.timeout(pointerof(WAIT_TIMESPEC), user_data: 0)
 
       # TODO: Proooobably need to be synchronized :(
-      @completions = Hash(UInt64, IOR::CQE).new
+      @completions = Hash(UInt64, IOR::CQE::Result).new
     end
 
     def new : self
@@ -34,7 +34,7 @@ module NestedScheduler
       ring_wait(scheduler) do |cqe|
         yield if cqe.canceled?
 
-        raise ::IO::Error.from_os_error("poll", cqe.cqe_errno) unless cqe.success?
+        raise ::IO::Error.from_os_error("poll", cqe.errno) unless cqe.success?
       end
     end
 
@@ -44,7 +44,7 @@ module NestedScheduler
       ring_wait(scheduler) do |cqe|
         yield if cqe.canceled?
 
-        raise ::IO::Error.from_os_error("poll", cqe.cqe_errno) unless cqe.success?
+        raise ::IO::Error.from_os_error("poll", cqe.errno) unless cqe.success?
       end
     end
 
@@ -54,12 +54,12 @@ module NestedScheduler
         get_sqe.accept(socket, user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
           if cqe.success?
-            return cqe.res
+            return cqe.to_i
           elsif socket.closed?
             return nil
           elsif cqe.eagain? # must be only non-escaping branch
           else
-            raise ::IO::Error.from_os_error("accept", cqe.cqe_errno)
+            raise ::IO::Error.from_os_error("accept", cqe.errno)
           end
         end
         # # Nonblocking sockets return EAGAIN if there isn't an
@@ -77,12 +77,12 @@ module NestedScheduler
         get_sqe.connect(socket, addr.to_unsafe.address, addr.size,
           user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
-          case cqe.cqe_errno
+          case cqe.errno
           when Errno::NONE, Errno::EISCONN
             return
           when Errno::EINPROGRESS, Errno::EALREADY
           else
-            return yield Socket::ConnectError.from_os_error("connect", os_error: cqe.cqe_errno)
+            return yield Socket::ConnectError.from_os_error("connect", os_error: cqe.errno)
           end
         end
         wait_writable(socket, scheduler, timeout: timeout) do
@@ -97,10 +97,10 @@ module NestedScheduler
         ring_wait(scheduler) do |cqe|
           case cqe
           when .success?
-            return cqe.res
+            return cqe.to_i
           when .eagain?
           else
-            raise ::IO::Error.from_os_error(errno_message, os_error: cqe.cqe_errno)
+            raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
         wait_writable(socket, scheduler, socket.write_timeout) do
@@ -124,9 +124,9 @@ module NestedScheduler
       get_sqe.sendmsg(socket, pointerof(hdr), user_data: userdata(scheduler))
       ring_wait(scheduler) do |cqe|
         if cqe.success?
-          cqe.res.to_i32
+          cqe.to_i.to_i32
         else
-          raise ::IO::Error.from_os_error("Error sending datagram to #{addr}", os_error: cqe.cqe_errno)
+          raise ::IO::Error.from_os_error("Error sending datagram to #{addr}", os_error: cqe.errno)
         end
       end
     end
@@ -138,11 +138,11 @@ module NestedScheduler
         ring_wait(scheduler) do |cqe|
           case cqe
           when .success?
-            bytes_written = cqe.res
+            bytes_written = cqe.to_i
             slice += bytes_written
             return if slice.size == 0
           when .eagain?
-          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.cqe_errno)
+          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
         wait_writable(socket, scheduler, timeout: socket.write_timeout) do
@@ -157,9 +157,9 @@ module NestedScheduler
         get_sqe.recv(socket, slice, user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.res
+          when .success? then return cqe.to_i
           when .eagain?
-          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.cqe_errno)
+          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
         wait_readable(socket, scheduler, timeout: socket.read_timeout) do
@@ -183,9 +183,9 @@ module NestedScheduler
         get_sqe.recvmsg(socket, pointerof(hdr), user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.res
+          when .success? then return cqe.to_i
           when .eagain?
-          else raise ::IO::Error.from_os_error(message: errno_message, os_error: cqe.cqe_errno)
+          else raise ::IO::Error.from_os_error(message: errno_message, os_error: cqe.errno)
           end
         end
         wait_readable(socket, scheduler, timeout: socket.read_timeout) do
@@ -204,10 +204,10 @@ module NestedScheduler
         get_sqe.read(io, slice, user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.res
+          when .success? then return cqe.to_i
           when .eagain?
-          when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for reading", os_error: cqe.cqe_errno)
-          else                            raise ::IO::Error.from_os_error(message: "Read Error", os_error: cqe.cqe_errno)
+          when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for reading", os_error: cqe.errno)
+          else                            raise ::IO::Error.from_os_error(message: "Read Error", os_error: cqe.errno)
           end
         end
         wait_readable(io, scheduler, timeout: io.read_timeout) do
@@ -222,10 +222,10 @@ module NestedScheduler
         get_sqe.write(io, slice, user_data: userdata(scheduler))
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.res
+          when .success? then return cqe.to_i
           when .eagain?
-          when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for writing", os_error: cqe.cqe_errno)
-          else                            raise ::IO::Error.from_os_error(message: "Write error", os_error: cqe.cqe_errno)
+          when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for writing", os_error: cqe.errno)
+          else                            raise ::IO::Error.from_os_error(message: "Write error", os_error: cqe.errno)
           end
         end
         wait_writable(io, scheduler, timeout: io.write_timeout) do
@@ -267,9 +267,9 @@ module NestedScheduler
       get_sqe.close(fd, user_data: userdata(scheduler))
       ring_wait(scheduler) do |cqe|
         return if cqe.success?
-        return if cqe.cqe_errno.eintr? || cqe.cqe_errno.einprogress?
+        return if cqe.errno.eintr? || cqe.errno.einprogress?
 
-        raise ::IO::Error.from_os_error("Error closing file", cqe.cqe_errno)
+        raise ::IO::Error.from_os_error("Error closing file", cqe.errno)
       end
     end
 
@@ -303,7 +303,12 @@ module NestedScheduler
 
     @[AlwaysInline]
     private def process_cqe(cqe) : Fiber
-      @completions[cqe.user_data] = cqe
+      if cqe.ring_error?
+        Crystal::System.print_error "BUG: IO URing error: #{cqe.error_message}\n"
+        exit
+      end
+      # FIXME: This is not safe. At all. Bleh.
+      @completions[cqe.user_data] = cqe.result
       fiber = Pointer(Fiber).new(cqe.user_data).as(Fiber)
       ring.seen cqe
       fiber
