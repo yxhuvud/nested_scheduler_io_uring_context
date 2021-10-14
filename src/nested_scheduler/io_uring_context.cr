@@ -1,5 +1,6 @@
 require "nested_scheduler"
 require "ior"
+require "../monkeypatch/fiber"
 
 module NestedScheduler
   class IoUringContext < IOContext
@@ -19,9 +20,6 @@ module NestedScheduler
       # can *always* do a blocking wait. No reason to actually submit
       # it until we may want to wait though.
       get_sqe.timeout(pointerof(WAIT_TIMESPEC), user_data: 0)
-
-      # TODO: Proooobably need to be synchronized :(
-      @completions = Hash(UInt64, IOR::CQE::Result).new
     end
 
     def new : self
@@ -307,9 +305,9 @@ module NestedScheduler
         Crystal::System.print_error "BUG: IO URing error: #{cqe.error_message}\n"
         exit
       end
-      # FIXME: This is not safe. At all. Bleh.
-      @completions[cqe.user_data] = cqe.result
+
       fiber = Pointer(Fiber).new(cqe.user_data).as(Fiber)
+      fiber.completion_result = cqe.result
       ring.seen cqe
       fiber
     end
@@ -346,7 +344,7 @@ module NestedScheduler
       scheduler.actually_reschedule
 
       fiber = scheduler.@current
-      yield @completions.delete(fiber.object_id) { raise "BUG" }
+      yield fiber.completion_result
     end
 
     @[AlwaysInline]
