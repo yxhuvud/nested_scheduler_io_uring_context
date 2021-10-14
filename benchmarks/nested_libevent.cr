@@ -1,4 +1,4 @@
-require "../src/nested_scheduler"
+require "nested_scheduler"
 require "http/server"
 
 threads = ARGV.any? ? ARGV[0].to_i : 4
