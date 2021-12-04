@@ -28,7 +28,7 @@ module NestedScheduler
 
     def wait_readable(io, scheduler, timeout)
       # TODO: Actually do timeouts.
-      get_sqe.poll_add(io, :POLLIN, user_data: userdata(scheduler))
+      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLIN | LibC::POLL_FLAG::POLLEXCLUSIVE, user_data: userdata(scheduler))
       ring_wait(scheduler) do |cqe|
         yield if cqe.canceled?
 
@@ -38,7 +38,7 @@ module NestedScheduler
 
     def wait_writable(io, scheduler, timeout)
       # TODO: Actually do timeouts..
-      get_sqe.poll_add(io, :POLLOUT, user_data: userdata(scheduler))
+      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLOUT | LibC::POLL_FLAG::POLLEXCLUSIVE, user_data: userdata(scheduler))
       ring_wait(scheduler) do |cqe|
         yield if cqe.canceled?
 
