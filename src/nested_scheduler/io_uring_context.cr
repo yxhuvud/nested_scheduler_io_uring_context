@@ -5,21 +5,13 @@ require "../monkeypatch/fiber"
 module NestedScheduler
   class IoUringContext < IOContext
     # What is a good waittime? Perhaps it needs to be a backoff?
-    # TODO: make use of ring timeout instead for this.
+    # TODO: Make use of notifier instead of timeouts.
     WAIT_TIMESPEC = LibC::Timespec.new(tv_sec: 0, tv_nsec: 50_000)
 
     getter :ring
 
-    #    getter :scheduler ::Crystal::Scheduler
-
-    def initialize(context = nil, size = 32)
+    def initialize(context = nil, size = 64)
       @ring = IOR::IOUring.new size: size
-      # Set up a timeout with userdata 0. There will always be one,
-      # and only one of these in flight. The purpose is to allow
-      # preemption of other stuff. This also has the upside that we
-      # can *always* do a blocking wait. No reason to actually submit
-      # it until we may want to wait though.
-      get_sqe.timeout(pointerof(WAIT_TIMESPEC), user_data: 0)
     end
 
     def new : self
@@ -27,43 +19,47 @@ module NestedScheduler
     end
 
     def wait_readable(io, scheduler, timeout)
-      # TODO: Actually do timeouts.
-      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLIN | LibC::POLL_FLAG::POLLEXCLUSIVE, user_data: userdata(scheduler))
+      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLIN | LibC::POLL_FLAG::POLLEXCLUSIVE,
+        user_data: userdata(scheduler), io_link: timeout)
+      link_timeout(timeout)
       ring_wait(scheduler) do |cqe|
-        yield if cqe.canceled?
+        # Strictly speaking we don't know if the op was canceled due
+        # to timeout or something else. Perhaps there is need to
+        # handle that, but hopefully not.
+        return yield if cqe.canceled?
 
         raise ::IO::Error.from_os_error("poll", cqe.errno) unless cqe.success?
       end
     end
 
     def wait_writable(io, scheduler, timeout)
-      # TODO: Actually do timeouts..
-      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLOUT | LibC::POLL_FLAG::POLLEXCLUSIVE, user_data: userdata(scheduler))
+      get_sqe.poll_add(io, LibC::POLL_FLAG::POLLOUT | LibC::POLL_FLAG::POLLEXCLUSIVE,
+        user_data: userdata(scheduler), io_link: timeout)
+      link_timeout(timeout)
       ring_wait(scheduler) do |cqe|
-        yield if cqe.canceled?
+        return yield if cqe.canceled?
 
         raise ::IO::Error.from_os_error("poll", cqe.errno) unless cqe.success?
       end
     end
 
     def accept(socket, scheduler, timeout)
-      # TODO: Timeout..
       loop do
-        get_sqe.accept(socket, user_data: userdata(scheduler))
+        get_sqe.accept(socket, user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
-          if cqe.success?
-            return cqe.to_i
-          elsif socket.closed?
-            return nil
-          elsif cqe.eagain? # must be only non-escaping branch
-          else
-            raise ::IO::Error.from_os_error("accept", cqe.errno)
+          case cqe
+          when .eagain?
+          when .success?      then return cqe.to_i
+          when .canceled?     then raise Socket::TimeoutError.new("Accept timed out")
+          when socket.closed? then return nil
+          else                     raise ::IO::Error.from_os_error("accept", cqe.errno)
           end
         end
-        # # Nonblocking sockets return EAGAIN if there isn't an
-        # # active connection attempt. To detect that wait_readable
-        # # is needed but that needs to happen outside ring_wait due
-        # # to the cqe needs to be marked as seen.
+        # Nonblocking sockets return EAGAIN if there isn't an
+        # active connection attempt. To detect that wait_readable
+        # is needed but that needs to happen outside ring_wait due
+        # to the cqe needs to be marked as seen.
         wait_readable(socket, scheduler, timeout) do
           raise Socket::TimeoutError.new("Accept timed out")
         end
@@ -73,14 +69,14 @@ module NestedScheduler
     def connect(socket, scheduler, addr, timeout)
       loop do
         get_sqe.connect(socket, addr.to_unsafe.address, addr.size,
-          user_data: userdata(scheduler))
+          user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe.errno
-          when Errno::NONE, Errno::EISCONN
-            return
           when Errno::EINPROGRESS, Errno::EALREADY
-          else
-            return yield Socket::ConnectError.from_os_error("connect", os_error: cqe.errno)
+          when Errno::NONE, Errno::EISCONN then return
+          when Errno::ECANCELED            then return yield ::IO::TimeoutError.new("connect timed out")
+          else                                  return yield Socket::ConnectError.from_os_error("connect", os_error: cqe.errno)
           end
         end
         wait_writable(socket, scheduler, timeout: timeout) do
@@ -89,20 +85,20 @@ module NestedScheduler
       end
     end
 
-    def send(socket, scheduler, slice : Bytes, errno_message : String) : Int32
+    def send(socket, scheduler, slice : Bytes, errno_message : String, timeout = socket.write_timeout) : Int32
       loop do
-        get_sqe.send(socket, slice, user_data: userdata(scheduler))
+        get_sqe.send(socket, slice, user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success?
-            return cqe.to_i
           when .eagain?
-          else
-            raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
+          when .success?  then return cqe.to_i
+          when .canceled? then raise ::IO::TimeoutError.new("Send timed out")
+          else                 raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
-        wait_writable(socket, scheduler, socket.write_timeout) do
-          raise ::IO::TimeoutError.new("connect timed out")
+        wait_writable(socket, scheduler, timeout) do
+          raise ::IO::TimeoutError.new("Send timed out")
         end
       end
     end
@@ -111,6 +107,7 @@ module NestedScheduler
       slice = message.to_slice
 
       # No sendto in uring, falling back to sendmsg.
+      # TODO: Use send, it is being expanded to cover sendto in 5.17-18?
       vec = LibC::IOVec.new(base: slice.to_unsafe, len: slice.size)
       hdr = LibC::MsgHeader.new(
         name: addr.to_unsafe.as(LibC::SockaddrStorage*),
@@ -129,45 +126,47 @@ module NestedScheduler
       end
     end
 
-    # TODO: handle write timeout, errmess
-    def socket_write(socket, scheduler, slice : Bytes, errno_message : String) : Nil
+    def socket_write(socket, scheduler, slice : Bytes, errno_message : String, timeout = socket.write_timeout) : Nil
       loop do
-        get_sqe.send(socket, slice, user_data: userdata(scheduler))
+        get_sqe.send(socket, slice, user_data: userdata(scheduler) , io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe
+          when .eagain?
           when .success?
             bytes_written = cqe.to_i
             slice += bytes_written
             return if slice.size == 0
-          when .eagain?
-          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
+          when .canceled? then raise ::IO::TimeoutError.new("socket write timed out")
+          else                 raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
-        wait_writable(socket, scheduler, timeout: socket.write_timeout) do
+        wait_writable(socket, scheduler, timeout: timeout) do
           raise ::IO::TimeoutError.new("socket write timed out")
         end
       end
     end
 
-    # TODO: handle read timeout
-    def recv(socket, scheduler, slice : Bytes, errno_message : String)
+    def recv(socket, scheduler, slice : Bytes, errno_message : String, timeout = socket.read_timeout)
       loop do
-        get_sqe.recv(socket, slice, user_data: userdata(scheduler))
+        get_sqe.recv(socket, slice, user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.to_i
           when .eagain?
-          else raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
+          when .success?  then return cqe.to_i
+          when .canceled? then raise ::IO::TimeoutError.new("Recv timed out")
+          else                 raise ::IO::Error.from_os_error(errno_message, os_error: cqe.errno)
           end
         end
-        wait_readable(socket, scheduler, timeout: socket.read_timeout) do
-          raise ::IO::TimeoutError.new("recv timed out")
+        wait_readable(socket, scheduler, timeout: timeout) do
+          raise ::IO::TimeoutError.new("Recv timed out")
         end
       end
     end
 
     # todo timeout.., errmess
-    def recvfrom(socket, scheduler, slice, sockaddr, addrlen, errno_message : String)
+    def recvfrom(socket, scheduler, slice, sockaddr, addrlen, errno_message : String, timeout = socket.read_timeout)
       # No recvfrom in uring, falling back to recvmsg.
       vec = LibC::IOVec.new(base: slice.to_unsafe, len: slice.size)
       hdr = LibC::MsgHeader.new(
@@ -176,58 +175,62 @@ module NestedScheduler
         iov: pointerof(vec),
         iovlen: 1
       )
-      # Fixme errono
+
       loop do
-        get_sqe.recvmsg(socket, pointerof(hdr), user_data: userdata(scheduler))
+        get_sqe.recvmsg(socket, pointerof(hdr), user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.to_i
           when .eagain?
-          else raise ::IO::Error.from_os_error(message: errno_message, os_error: cqe.errno)
+          when .success?  then return cqe.to_i
+          when .canceled? then raise ::IO::TimeoutError.new("receive timed out")
+          else                 raise ::IO::Error.from_os_error(message: errno_message, os_error: cqe.errno)
           end
         end
-        wait_readable(socket, scheduler, timeout: socket.read_timeout) do
+        wait_readable(socket, scheduler, timeout: timeout) do
           raise ::IO::TimeoutError.new("receive timed out")
         end
       end
     end
 
-    # TODO: handle read timeout
-    def read(io, scheduler, slice : Bytes)
-      # Loop due to EAGAIN. EAGAIN happens at least once during
-      # scheduler setup. I'm not totally happy with doing read in a
-      # loop like this but I havn't figured out a better way to make
-      # it work.
+    def read(io, scheduler, slice : Bytes, timeout = io.read_timeout)
       loop do
-        get_sqe.read(io, slice, user_data: userdata(scheduler))
+        get_sqe.read(io, slice, user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
+#        Crystal::System.print_error "#{io.inspect}\n"
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.to_i
           when .eagain?
+  #          Crystal::System.print_error "eag\n"
+          when .success?             then return cqe.to_i
+          when .canceled?            then raise ::IO::TimeoutError.new("read timed out")
           when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for reading", os_error: cqe.errno)
           else                            raise ::IO::Error.from_os_error(message: "Read Error", os_error: cqe.errno)
           end
         end
-        wait_readable(io, scheduler, timeout: io.read_timeout) do
+ #       Crystal::System.print_error "WR\n"
+        wait_readable(io, scheduler, timeout: timeout) do
           raise ::IO::TimeoutError.new("read timed out")
         end
       end
     end
 
     # TODO: add write timeout
-    def write(io, scheduler, slice : Bytes)
+    def write(io, scheduler, slice : Bytes, timeout = io.write_timeout)
       loop do
-        get_sqe.write(io, slice, user_data: userdata(scheduler))
+        get_sqe.write(io, slice, user_data: userdata(scheduler), io_link: timeout)
+        link_timeout(timeout)
         ring_wait(scheduler) do |cqe|
           case cqe
-          when .success? then return cqe.to_i
           when .eagain?
+          when .success?             then return cqe.to_i
+          when .canceled?            then raise ::IO::TimeoutError.new("write timed out")
           when .bad_file_descriptor? then raise ::IO::Error.from_os_error(message: "File not open for writing", os_error: cqe.errno)
           else                            raise ::IO::Error.from_os_error(message: "Write error", os_error: cqe.errno)
           end
         end
-        wait_writable(io, scheduler, timeout: io.write_timeout) do
-          raise ::IO::TimeoutError.new("recvfrom timed out")
+        wait_writable(io, scheduler, timeout: timeout) do
+          raise ::IO::TimeoutError.new("write timed out")
         end
       end
     end
@@ -273,24 +276,35 @@ module NestedScheduler
 
     # TODO: handle submit failure?
     def reschedule(scheduler)
-      # Controls the ring submit as the submit_and_wait variant saves
-      # us a syscall.
       loop do
         if runnable = yield
+          # TODO: Is there a need for a deadline where events are
+          # always submitted if too old? Compute heavy load with few
+          # events might get higher latency than what is nice? Or
+          # should submit simply be eager?
+
           # Can't do linked timeouts if there are not at least 2 sqe
-          # slots left.
-          ring.submit if ring.unsubmitted? && (ring.sq_space_left < 2)
+          # slots left, so leave some space for that.
+          ring.submit if ring.unsubmitted? # && (ring.sq_space_left < 2)
         else
-          # Note that #wait actually don't do a syscall after
-          # #submit_and_wait as there is a waiting cqe already.
-          ring.submit_and_wait if ring.unsubmitted?
-          cqe = ring.wait
+          # TODO: Change to submit_and_wait with timeout when that is
+          # supported.
+          ring.submit if ring.unsubmitted?
+          cqe = ring.wait(timeout: pointerof(WAIT_TIMESPEC))
+          # Wait timeout has occurred, check if anything has been
+          # unscheduled in the interim.
+          # TODO: Change to notifier on enqueue?
+          next unless cqe
+          next if skippable?(cqe)
 
-          next if handle_autowakeup?(cqe)
           runnable = process_cqe(cqe)
-          while cqe = ring.peek
-            next if handle_autowakeup?(cqe)
 
+          # Tried to get peek(into: ) to do the same, more
+          # efficiently, but got some strange error that I don't
+          # understand.
+          while cqe = ring.peek
+#            Crystal::System.print_error "ab\n"
+            next if skippable?(cqe)
             scheduler.actually_enqueue(process_cqe(cqe))
           end
         end
@@ -300,33 +314,28 @@ module NestedScheduler
     end
 
     @[AlwaysInline]
+    private def skippable?(cqe)
+ #      Crystal::System.print_error "skip\n"
+      # IO timeout has occurred. Do nothing, the result is handled
+      # in CQE corresponding to the linked SQE.
+      if cqe.user_data == 0
+        ring.seen cqe
+        true
+      else
+        false
+      end
+    end
+
+    @[AlwaysInline]
     private def process_cqe(cqe) : Fiber
       if cqe.ring_error?
         Crystal::System.print_error "BUG: IO URing error: #{cqe.error_message}\n"
         exit
       end
-
       fiber = Pointer(Fiber).new(cqe.user_data).as(Fiber)
       fiber.completion_result = cqe.result
       ring.seen cqe
       fiber
-    end
-
-    @[AlwaysInline]
-    private def handle_autowakeup?(cqe)
-      if cqe.user_data.zero?
-        # That is, CQE is timeout that has expired. Read the
-        # timeout and try another iteration and see if anything
-        # can be done now.
-
-        # TODO: Instead of recurring timeouts like this, make use
-        # of the new timeouts on submit_and_wait
-        ring.seen cqe
-        get_sqe.timeout(pointerof(WAIT_TIMESPEC), user_data: 0)
-        true
-      else
-        false
-      end
     end
 
     @[AlwaysInline]
@@ -355,6 +364,14 @@ module NestedScheduler
     @[AlwaysInline]
     private def userdata(fiber : Fiber)
       fiber.object_id
+    end
+
+    # Needs to be a macro to keep the timespec in scope
+    macro link_timeout(timeout)
+      if %timeout = {{timeout}}
+        %timespec = LibC::Timespec.new(tv_sec: %timeout.to_i, tv_nsec: %timeout.nanoseconds)
+        get_sqe.link_timeout(pointerof(%timespec), user_data: 0)
+      end
     end
   end
 end
